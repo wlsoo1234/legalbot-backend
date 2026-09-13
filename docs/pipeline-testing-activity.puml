@@ -1,0 +1,151 @@
+' ============================================================
+'  LegalBot RAG Pipeline — Full Testing + Activity Diagrams
+'  Two diagrams in this file:
+'    [1] Sequence diagram  — testing flow (tester ↔ API ↔ services)
+'    [2] Activity diagram  — internal pipeline processing steps
+' ============================================================
+
+' ─────────────────────────────────────────────────────────────
+'  DIAGRAM 2 — Pipeline Activity Diagram
+' ─────────────────────────────────────────────────────────────
+@startuml pipeline-activity
+title LegalBot RAG Pipeline — Activity Diagram
+
+skinparam activityBackgroundColor #1e3a5f
+skinparam activityBorderColor     #4a90d9
+skinparam activityFontColor       #ffffff
+skinparam activityDiamondBackgroundColor #2c5f2e
+skinparam activityDiamondBorderColor     #4ad96e
+skinparam activityDiamondFontColor       #ffffff
+skinparam arrowColor              #aaaaaa
+skinparam noteBackgroundColor     #FFFDE7
+skinparam noteBorderColor         #B8860B
+skinparam partitionBorderColor    #666
+
+start
+
+' ── PREREQUISITE ────────────────────────────────────────────
+:POST /api/v1/rag/sources\n{jurisdiction · doc_type · trust_level · source_type · title · source_org};
+note right: Step 0 — register once per document collection
+:AlloyDB INSERT legal_sources;
+:Return source_id;
+
+' ── INGEST ───────────────────────────────────────────────────
+partition "① ingest_service  —  sync, runs in HTTP request" {
+    :POST /api/v1/d3/sources/{source_id}/ingest/file\n(multipart PDF upload);
+    :Read file bytes;
+    :Compute SHA-256 hash;
+    if (SHA-256 already in documents\nfor this source?) then (yes)
+        #CC0000:500 Duplicate content;
+        stop
+    else (no)
+    endif
+    :Upload raw PDF to GCS\ngs://kitahack/legal/raw/{source_id}/{doc_id}.pdf;
+    :INSERT documents  status=pending\ndoc_id · source_id · gcs_uri_raw · content_sha256;
+    :Return 202 Accepted\n{doc_id, status="pending"};
+}
+
+note right
+  Background thread started via
+  loop.run_in_executor(None, _run_pipeline, …)
+  Client polls GET /d3/documents/{doc_id}
+end note
+
+' ── EXTRACT ──────────────────────────────────────────────────
+partition "② extract_service  —  background thread" {
+    :Download raw PDF blob from GCS;
+    :Extract text page-by-page\n(PyPDF2 / pdfminer);
+    if (extracted_text_length\n< 200 chars?) then (yes)
+        #CC0000:mark_failed  status=failed\nerror_message = "text too short";
+        stop
+    else (no)
+    endif
+    :Serialize to extracted JSON\n{full_text, page_map, metadata};
+    :Upload to GCS\ngs://kitahack/legal/extracted/{source_id}/{doc_id}.json;
+    :UPDATE documents\nstatus=extracted · page_count · extracted_text_length;
+}
+
+' ── CHUNK ────────────────────────────────────────────────────
+partition "③ chunk_service  —  Agentic Chunking  (gemini-2.5-flash)" {
+    :Download extracted JSON from GCS;
+    :Validate source metadata;
+    if (Missing jurisdiction\nor doc_type or invalid\ntrust_level / language?) then (yes)
+        #CC0000:mark_failed  ValidationError;
+        stop
+    else (no)
+    endif
+
+    group Structural Split
+        :_split_at_legal_headings(full_text)\nRegex: PART I … / Chapter … /\n"1. Short title" / numbered provisions\n→ list of (start, end, heading);
+        :_recursive_split(segment)\nSub-split segments > 3 000 chars\nat \\n\\n  →  \\n  →  ". "  →  " ";
+    end group
+
+    group Normalise
+        :Merge tiny fragments < 150 chars\ninto preceding chunk  +  overlap 100 chars;
+        :Post-merge re-split\nChunks still > 3 000 chars → split again;
+        :Extract heading from first 1-2 lines\nper chunk;
+    end group
+
+    group Gemini Labelling
+        :_label_with_gemini(raw_chunks, doc_type)\nBuild indexed list:\n  [i] heading: "…"  |  preview: "…"\nSingle batch API call → gemini-2.5-flash\nExpects JSON array:\n  [{section_title, proposition}, …];
+        if (Gemini API call\nsucceeded?) then (no)
+            :Fallback: section_title = raw_heading\nproposition = "";
+        else (yes)
+            :Apply Gemini labels\nsection_title · proposition;
+        endif
+    end group
+
+    group Persist
+        :Build ChunkRecord list\n(chunk_id · doc_id · chunk_index · text ·\ntoken_estimate · page_start/end ·\nsection_title · jurisdiction …);
+        :upsert_chunks(chunks, batch=200)\nSingle multi-row INSERT INTO chunks\nON CONFLICT (chunk_id) DO NOTHING\n→ one DB round-trip per 200 chunks;
+        :repo.upsert_document() → INSERT legal_documents;
+        :UPDATE documents\nstatus=ready · chunk_count=N;
+    end group
+}
+
+' ── EMBED ────────────────────────────────────────────────────
+partition "④ embed_service  —  D4 Embedding  (gemini-embedding-001)" {
+    :SELECT chunks LEFT JOIN chunk_vectors\nWHERE chunk_vectors.chunk_id IS NULL\nAND doc_id = {doc_id}\nORDER BY chunk_index;
+    if (All chunks already\nembedded?) then (yes)
+        :Skip embedding step;
+    else (no)
+        :_embed_texts_sync(texts, RETRIEVAL_DOCUMENT)\nmodels/gemini-embedding-001\noutput_dimensionality=768\nbatches of 100 texts per API call;
+        :Single multi-row INSERT INTO chunk_vectors\n(chunk_id · doc_id · jurisdiction · doc_type ·\ntrust_level · effective_date · embedding::vector)\nON CONFLICT DO UPDATE SET embedding = EXCLUDED.embedding;
+        note right: IVFFlat cosine index\n(lists=100)\npopulated for ANN retrieval
+    endif
+}
+
+:✅  Pipeline complete\nstatus=ready  ·  183 chunks  ·  183 vectors;
+
+' ── QUERY ────────────────────────────────────────────────────
+partition "⑤ RAG Query  —  POST /api/v1/rag/ask" {
+
+    :Receive {question, jurisdiction, top_k\n(optionally: doc_type, trust_level_max)};
+
+    group Embed Question
+        :GeminiEmbeddingProvider.embed_text(question)\ntask_type = RETRIEVAL_QUERY\n→ 768-d query vector;
+    end group
+
+    group Vector Retrieval  (AlloyDB pgvector)
+        :AlloyDBVectorRepository.query()\nSELECT chunk_id,\n  1-(embedding <=> query_vec) AS score\nFROM chunk_vectors\nWHERE jurisdiction = 'MY'\n  [AND doc_type / trust_level filters]\nORDER BY embedding <=> query_vec\nLIMIT top_k\n→ [(chunk_id, score), …] ranked by cosine similarity;
+    end group
+
+    group Fetch Metadata  (AlloyDB D3)
+        :get_chunks(chunk_ids)\n→ ChunkRecord list\n(text · section_title · page_start/end …)\nget_document(doc_id)\n→ LegalDocument (title · provider · url …);
+    end group
+
+    group Build Context
+        :Assemble numbered context block:\n[1] Source: Contracts Act 1950 (AGC) — Void Agreements…\nfull chunk text\n---\n[2] Source: Contracts Act 1950 … — Lawful Consideration…\nfull chunk text\n…;
+    end group
+
+    group LLM Generation  (gemini-2.5-flash)
+        :_generate_answer(question, context)\nRAG-grounded prompt:\n• Answer ONLY from provided sources\n• Cite every claim with [N] inline ref\n• Plain English — non-lawyer Malaysian tenant\n• 3–6 sentences unless more needed;
+        :Strip markdown fences from response;
+    end group
+
+    :Return RagAnswerResponse\n{\n  answer: "Yes, an agreement without consideration\n          is void [1][5]. Exceptions include…",\n  citations: [\n    { title, provider, section, excerpt,\n      page_start, page_end, chunk_id, doc_id }\n  ]\n};
+}
+
+stop
+
+@enduml

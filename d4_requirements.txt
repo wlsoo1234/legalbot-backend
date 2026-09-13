@@ -1,0 +1,202 @@
+You are building D4 Vector Index module for a FastAPI backend using:
+
+- FastAPI (async)
+- SQLAlchemy 2.0 (async)
+- PostgreSQL (AlloyDB)
+- pgvector extension
+- Pydantic v2
+- Clean architecture (routers / services / repositories)
+
+This module must implement:
+
+1) Embedding storage for legal chunks
+2) Top-K similarity search with optional metadata filters
+3) Async database access
+4) Ready for Vertex AI embeddings integration later
+
+------------------------------------------------------------
+PROJECT STRUCTURE TO GENERATE
+------------------------------------------------------------
+
+Create the following files:
+
+app/d4_vector_index/
+    __init__.py
+    models.py
+    schemas.py
+    repository.py
+    service.py
+    router.py
+    embeddings.py
+
+------------------------------------------------------------
+DATABASE DESIGN
+------------------------------------------------------------
+
+We already have a table:
+
+legal_chunks(
+    chunk_id UUID PRIMARY KEY,
+    text TEXT NOT NULL,
+    jurisdiction TEXT NOT NULL,
+    doc_type TEXT NOT NULL,
+    language TEXT NOT NULL,
+    trust_level SMALLINT NOT NULL,
+    effective_date DATE,
+    page_start INT,
+    page_end INT
+)
+
+You must create SQLAlchemy model for:
+
+legal_chunk_embeddings(
+    chunk_id UUID PRIMARY KEY REFERENCES legal_chunks(chunk_id) ON DELETE CASCADE,
+    embedding VECTOR(768) NOT NULL,
+    model TEXT NOT NULL,
+    embedded_at TIMESTAMP WITH TIME ZONE DEFAULT now()
+)
+
+Use pgvector SQLAlchemy integration.
+
+Assume embedding dimension = 768.
+Similarity metric = cosine.
+
+------------------------------------------------------------
+FUNCTIONAL REQUIREMENTS
+------------------------------------------------------------
+
+1) Embedding storage
+
+Implement function:
+
+async def store_embedding(chunk_id: UUID, embedding: list[float], model: str)
+
+It must:
+- Upsert embedding
+- Validate dimension = 768
+- Commit transaction
+
+------------------------------------------------------------
+
+2) Top-K retrieval
+
+Implement:
+
+async def retrieve_top_k(
+    query_embedding: list[float],
+    top_k: int = 8,
+    jurisdiction: Optional[str] = None,
+    doc_type: Optional[str] = None,
+    language: Optional[str] = None,
+    trust_max: Optional[int] = None
+)
+
+It must:
+
+- Join legal_chunk_embeddings with legal_chunks
+- Use cosine distance operator <=> 
+- Order by similarity
+- Return:
+
+[
+  {
+    "chunk_id": UUID,
+    "score": float
+  }
+]
+
+Score formula:
+score = 1 - (embedding <=> query_embedding)
+
+Support optional filters:
+- jurisdiction
+- doc_type
+- language
+- trust_level <= trust_max
+
+------------------------------------------------------------
+
+3) FastAPI Router
+
+Create endpoints:
+
+POST /d4/embed
+Body:
+{
+  "chunk_id": "uuid",
+  "embedding": [float, ...],
+  "model": "text-embedding-004"
+}
+
+POST /d4/retrieve
+Body:
+{
+  "query_embedding": [...],
+  "top_k": 8,
+  "filters": {
+      "jurisdiction": "MY",
+      "doc_type": "deposit",
+      "language": "en",
+      "trust_max": 2
+  }
+}
+
+Response:
+{
+  "results": [
+    {"chunk_id": "...", "score": 0.83}
+  ]
+}
+
+------------------------------------------------------------
+
+4) Embeddings Service Stub
+
+Create embeddings.py with:
+
+async def embed_text(text: str) -> list[float]
+
+For now return random vector (length 768).
+Later will integrate Vertex AI.
+
+------------------------------------------------------------
+
+5) Clean Code Requirements
+
+- Use async SQLAlchemy session dependency
+- No blocking code
+- Use Pydantic models for request/response
+- Separate repository and service logic
+- Add basic exception handling
+- Add type hints everywhere
+- No global sessions
+
+------------------------------------------------------------
+
+6) Include SQL migration example
+
+Add comment block with raw SQL:
+
+CREATE EXTENSION IF NOT EXISTS vector;
+
+CREATE TABLE legal_chunk_embeddings(
+  chunk_id UUID PRIMARY KEY REFERENCES legal_chunks(chunk_id) ON DELETE CASCADE,
+  embedding vector(768) NOT NULL,
+  model TEXT NOT NULL,
+  embedded_at TIMESTAMPTZ DEFAULT now()
+);
+
+CREATE INDEX legal_chunk_embeddings_cos_idx
+ON legal_chunk_embeddings
+USING ivfflat (embedding vector_cosine_ops)
+WITH (lists = 100);
+
+------------------------------------------------------------
+
+Generate complete working code.
+Ensure imports are correct.
+Use pgvector.sqlalchemy.Vector type.
+Assume PostgreSQL.
+Do not omit any file.
+Do not summarize.
+Output full file contents.

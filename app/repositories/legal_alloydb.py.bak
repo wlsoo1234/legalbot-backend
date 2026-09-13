@@ -1,0 +1,517 @@
+"""
+repositories/legal_alloydb.py — AlloyDB + pgvector implementations of
+LegalKnowledgeRepository and VectorIndexRepository.
+
+These are drop-in replacements for the in-memory versions in legal_memory.py.
+Swap them in via deps_rag.py by setting USE_ALLOYDB=true in .env — no router
+or service code changes required.
+
+Prerequisites
+-------------
+1. Run app/db/schema.sql against your AlloyDB instance once.
+2. Set these env vars in .env:
+     ALLOYDB_INSTANCE_URI  projects/<P>/locations/<R>/clusters/<C>/instances/<I>
+     ALLOYDB_DB, ALLOYDB_USER, ALLOYDB_PASSWORD
+     USE_ALLOYDB=true
+
+Threading
+---------
+Each method borrows one connection from the ThreadedConnectionPool in
+app/db/alloydb.py (via the `get_connection()` context manager) and returns
+it when done.  Safe for multi-threaded FastAPI/uvicorn workers.
+"""
+
+from __future__ import annotations
+
+import json
+import uuid
+from datetime import date, datetime, timezone
+
+import psycopg2.extras  # for RealDictCursor
+
+from app.db.alloydb import get_connection
+from app.repositories.legal_base import LegalKnowledgeRepository, VectorIndexRepository
+from app.schemas_rag import (
+    ChunkRecord,
+    LegalDocument,
+    LegalSourceCreate,
+    RegisteredSource,
+    SourceRegisterRequest,
+    SourceUpdateRequest,
+)
+
+# Register UUID adapter so psycopg2 returns uuid columns as str
+psycopg2.extras.register_uuid()
+
+
+# ---------------------------------------------------------------------------
+# Helper — row dict → Pydantic models
+# ---------------------------------------------------------------------------
+
+def _row_to_registered_source(row: dict) -> RegisteredSource:
+    return RegisteredSource(
+        source_id=str(row["source_id"]),
+        source_type=row["source_type"],
+        canonical_url=row.get("canonical_url"),
+        title=row.get("title"),
+        source_org=row.get("source_org"),
+        trust_level=int(row["trust_level"]),
+        jurisdiction=row["jurisdiction"],
+        doc_type=row["doc_type"],
+        language=row.get("language", "en"),
+        effective_date=row.get("effective_date"),
+        tags=list(row.get("tags") or []),
+        created_at=row["created_at"],
+        updated_at=row["updated_at"],
+        status=row.get("status", "registered"),
+    )
+
+
+def _row_to_legal_document(row: dict) -> LegalDocument:
+    return LegalDocument(
+        doc_id=str(row["doc_id"]),
+        source_id=str(row["source_id"]) if row.get("source_id") else None,
+        provider=row.get("provider"),
+        title=row.get("title"),
+        url=row.get("url"),
+        jurisdiction=row["jurisdiction"],
+        doc_type=row["doc_type"],
+        created_at=row.get("created_at"),
+    )
+
+
+def _row_to_chunk_record(row: dict) -> ChunkRecord:
+    return ChunkRecord(
+        chunk_id=str(row["chunk_id"]),
+        doc_id=str(row["doc_id"]),
+        chunk_index=int(row.get("chunk_index", 0)),
+        text=row["text"],
+        token_estimate=row.get("token_estimate"),
+        page_start=row.get("page_start"),
+        page_end=row.get("page_end"),
+        section_title=row.get("section_title"),
+        url_fragment=row.get("url_fragment"),
+        char_start=row.get("char_start"),
+        char_end=row.get("char_end"),
+        jurisdiction=row.get("jurisdiction", ""),
+        doc_type=row.get("doc_type", ""),
+        effective_date=row.get("effective_date"),
+        language=row.get("language", "en"),
+        source_org=row.get("source_org"),
+        trust_level=int(row.get("trust_level", 3)),
+        tags=list(row.get("tags") or []),
+        version_label=row.get("version_label"),
+        created_at=row["created_at"],
+    )
+
+
+# ---------------------------------------------------------------------------
+# D3 — AlloyDB LegalKnowledgeRepository
+# ---------------------------------------------------------------------------
+
+class AlloyDBKnowledgeRepository(LegalKnowledgeRepository):
+    """
+    Persists legal sources, documents, and chunks in AlloyDB (PostgreSQL).
+    Chunking is delegated to the caller (RagService) just like the in-memory
+    implementation — this repo only handles storage.
+    """
+
+    # ------------------------------------------------------------------
+    # Source registry
+    # ------------------------------------------------------------------
+
+    def register_source(self, request: SourceRegisterRequest) -> RegisteredSource:
+        source_id = str(uuid.uuid4())
+        now = datetime.now(timezone.utc)
+        with get_connection() as conn:
+            with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+                cur.execute(
+                    """
+                    INSERT INTO legal_sources (
+                        source_id, source_type, canonical_url, title, source_org,
+                        trust_level, jurisdiction, doc_type, language, effective_date,
+                        tags, status, created_at, updated_at
+                    ) VALUES (
+                        %(source_id)s, %(source_type)s, %(canonical_url)s, %(title)s,
+                        %(source_org)s, %(trust_level)s, %(jurisdiction)s, %(doc_type)s,
+                        %(language)s, %(effective_date)s, %(tags)s, 'registered',
+                        %(created_at)s, %(updated_at)s
+                    )
+                    RETURNING *
+                    """,
+                    {
+                        "source_id": source_id,
+                        "source_type": request.source_type,
+                        "canonical_url": request.canonical_url,
+                        "title": request.title,
+                        "source_org": request.source_org,
+                        "trust_level": request.trust_level,
+                        "jurisdiction": request.jurisdiction,
+                        "doc_type": request.doc_type,
+                        "language": request.language,
+                        "effective_date": request.effective_date,
+                        "tags": list(request.tags),
+                        "created_at": now,
+                        "updated_at": now,
+                    },
+                )
+                row = dict(cur.fetchone())
+        return _row_to_registered_source(row)
+
+    def get_source(self, source_id: str) -> RegisteredSource | None:
+        with get_connection() as conn:
+            with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+                cur.execute(
+                    "SELECT * FROM legal_sources WHERE source_id = %s",
+                    (source_id,),
+                )
+                row = cur.fetchone()
+        return _row_to_registered_source(dict(row)) if row else None
+
+    def update_source(
+        self, source_id: str, updates: SourceUpdateRequest
+    ) -> RegisteredSource | None:
+        patch = {k: v for k, v in updates.model_dump().items() if v is not None}
+        if not patch:
+            return self.get_source(source_id)
+
+        patch["updated_at"] = datetime.now(timezone.utc)
+        set_clause = ", ".join(f"{col} = %({col})s" for col in patch)
+        patch["source_id"] = source_id
+
+        with get_connection() as conn:
+            with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+                cur.execute(
+                    f"UPDATE legal_sources SET {set_clause} "
+                    f"WHERE source_id = %(source_id)s RETURNING *",
+                    patch,
+                )
+                row = cur.fetchone()
+        return _row_to_registered_source(dict(row)) if row else None
+
+    def list_sources(
+        self,
+        jurisdiction: str | None = None,
+        doc_type: str | None = None,
+        status: str | None = None,
+    ) -> list[RegisteredSource]:
+        clauses = ["1=1"]
+        params: dict = {}
+        if jurisdiction:
+            clauses.append("jurisdiction = %(jurisdiction)s")
+            params["jurisdiction"] = jurisdiction
+        if doc_type:
+            clauses.append("doc_type = %(doc_type)s")
+            params["doc_type"] = doc_type
+        if status is not None:
+            clauses.append("status = %(status)s")
+            params["status"] = status
+
+        where = " AND ".join(clauses)
+        with get_connection() as conn:
+            with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+                cur.execute(
+                    f"SELECT * FROM legal_sources WHERE {where} ORDER BY created_at DESC",
+                    params,
+                )
+                rows = cur.fetchall()
+        return [_row_to_registered_source(dict(r)) for r in rows]
+
+    def link_doc_to_source(self, source_id: str, doc_id: str) -> None:
+        with get_connection() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """
+                    UPDATE legal_sources
+                       SET status = 'ingested',
+                           updated_at = NOW()
+                     WHERE source_id = %s
+                    """,
+                    (source_id,),
+                )
+
+    # ------------------------------------------------------------------
+    # Document + chunk store
+    # ------------------------------------------------------------------
+
+    def upsert_document(
+        self,
+        source: LegalSourceCreate,
+        text: str,
+    ) -> tuple[LegalDocument, list[ChunkRecord]]:
+        """
+        Create or replace a legal_documents row and chunk the provided text.
+
+        Idempotent: if a document with the same (provider, title, jurisdiction)
+        already exists its stale chunks/vectors are deleted before re-ingesting.
+        """
+        from app.repositories.legal_memory import _chunk_text  # noqa: PLC0415
+
+        now = datetime.now(timezone.utc)
+        with get_connection() as conn:
+            with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+                cur.execute(
+                    """
+                    SELECT doc_id FROM legal_documents
+                     WHERE provider = %s AND title = %s AND jurisdiction = %s
+                    """,
+                    (source.provider, source.title, source.jurisdiction),
+                )
+                existing = cur.fetchone()
+
+                if existing:
+                    doc_id = str(existing["doc_id"])
+                    # Remove stale chunks so they'll be replaced
+                    cur.execute("DELETE FROM chunks WHERE doc_id = %s", (doc_id,))
+                    cur.execute("DELETE FROM chunk_vectors WHERE doc_id = %s", (doc_id,))
+                    cur.execute(
+                        "UPDATE legal_documents SET url = %s WHERE doc_id = %s",
+                        (source.url, doc_id),
+                    )
+                else:
+                    doc_id = str(uuid.uuid4())
+                    cur.execute(
+                        """
+                        INSERT INTO legal_documents
+                          (doc_id, source_id, provider, title, url,
+                           jurisdiction, doc_type, created_at)
+                        VALUES (%s,%s,%s,%s,%s,%s,%s,%s)
+                        """,
+                        (
+                            doc_id,
+                            None,
+                            source.provider,
+                            source.title,
+                            source.url,
+                            source.jurisdiction,
+                            source.doc_type,
+                            now,
+                        ),
+                    )
+
+        doc = LegalDocument(
+            doc_id=doc_id,
+            source_id=None,
+            provider=source.provider,
+            title=source.title,
+            url=source.url,
+            jurisdiction=source.jurisdiction,
+            doc_type=source.doc_type,
+            created_at=now,
+        )
+
+        chunks = _chunk_text(text, doc_id, source)
+        if chunks:
+            self.upsert_chunks(chunks)
+        return doc, chunks
+
+    def upsert_chunks(self, chunks: list[ChunkRecord]) -> None:
+        """Persist a batch of ChunkRecords to the `chunks` table."""
+        if not chunks:
+            return
+        with get_connection() as conn:
+            with conn.cursor() as cur:
+                psycopg2.extras.execute_batch(
+                    cur,
+                    """
+                    INSERT INTO chunks
+                      (chunk_id, doc_id, chunk_index, text, token_estimate,
+                       page_start, page_end, section_title, url_fragment,
+                       char_start, char_end, jurisdiction, doc_type,
+                       effective_date, language, source_org, trust_level,
+                       tags, version_label, created_at)
+                    VALUES (%(chunk_id)s, %(doc_id)s, %(chunk_index)s, %(text)s,
+                            %(token_estimate)s, %(page_start)s, %(page_end)s,
+                            %(section_title)s, %(url_fragment)s, %(char_start)s,
+                            %(char_end)s, %(jurisdiction)s, %(doc_type)s,
+                            %(effective_date)s, %(language)s, %(source_org)s,
+                            %(trust_level)s, %(tags)s, %(version_label)s, %(created_at)s)
+                    ON CONFLICT (chunk_id) DO NOTHING
+                    """,
+                    [
+                        {
+                            "chunk_id": c.chunk_id,
+                            "doc_id": c.doc_id,
+                            "chunk_index": c.chunk_index,
+                            "text": c.text,
+                            "token_estimate": c.token_estimate,
+                            "page_start": c.page_start,
+                            "page_end": c.page_end,
+                            "section_title": c.section_title,
+                            "url_fragment": c.url_fragment,
+                            "char_start": c.char_start,
+                            "char_end": c.char_end,
+                            "jurisdiction": c.jurisdiction,
+                            "doc_type": c.doc_type,
+                            "effective_date": c.effective_date,
+                            "language": c.language,
+                            "source_org": c.source_org,
+                            "trust_level": c.trust_level,
+                            "tags": list(c.tags),
+                            "version_label": c.version_label,
+                            "created_at": c.created_at,
+                        }
+                        for c in chunks
+                    ],
+                    page_size=100,
+                )
+
+    def get_document(self, doc_id: str) -> LegalDocument | None:
+        with get_connection() as conn:
+            with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+                cur.execute(
+                    "SELECT * FROM legal_documents WHERE doc_id = %s", (doc_id,)
+                )
+                row = cur.fetchone()
+        return _row_to_legal_document(dict(row)) if row else None
+
+    def save_document(self, doc: LegalDocument) -> None:
+        """Persist a pre-built LegalDocument row (idempotent — no-op on duplicate doc_id)."""
+        with get_connection() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """
+                    INSERT INTO legal_documents
+                      (doc_id, source_id, provider, title, url,
+                       jurisdiction, doc_type, created_at)
+                    VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
+                    ON CONFLICT (doc_id) DO NOTHING
+                    """,
+                    (
+                        doc.doc_id,
+                        doc.source_id,
+                        doc.provider,
+                        doc.title,
+                        doc.url,
+                        doc.jurisdiction,
+                        doc.doc_type,
+                        doc.created_at,
+                    ),
+                )
+
+    def get_chunks(self, chunk_ids: list[str]) -> list[ChunkRecord]:
+        if not chunk_ids:
+            return []
+        with get_connection() as conn:
+            with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+                cur.execute(
+                    "SELECT * FROM chunks WHERE chunk_id = ANY(%s)",
+                    (chunk_ids,),
+                )
+                rows = cur.fetchall()
+        # Preserve input order
+        row_map = {str(r["chunk_id"]): _row_to_chunk_record(dict(r)) for r in rows}
+        return [row_map[cid] for cid in chunk_ids if cid in row_map]
+
+
+# ---------------------------------------------------------------------------
+# D4 — AlloyDB pgvector VectorIndexRepository
+# ---------------------------------------------------------------------------
+
+class AlloyDBVectorRepository(VectorIndexRepository):
+    """
+    Stores embeddings in the ``chunk_vectors`` table using the pgvector
+    ``vector`` type.  Uses cosine distance (``<=>`` operator) for retrieval.
+
+    The IVFFlat index (created in schema.sql) speeds up approximate nearest-
+    neighbour search.  Rebuild it periodically with::
+
+        VACUUM ANALYZE chunk_vectors;
+        -- then re-run CREATE INDEX ... if the row count has grown significantly.
+    """
+
+    def upsert_vectors(
+        self, items: list[tuple[str, list[float], dict]]
+    ) -> None:
+        """
+        Insert or replace (chunk_id, embedding, metadata) triples.
+        The embedding is stored as a pgvector ``vector`` literal.
+        """
+        if not items:
+            return
+        with get_connection() as conn:
+            with conn.cursor() as cur:
+                psycopg2.extras.execute_batch(
+                    cur,
+                    """
+                    INSERT INTO chunk_vectors
+                      (chunk_id, doc_id, jurisdiction, doc_type,
+                       trust_level, effective_date, source_org, embedding)
+                    VALUES (
+                        %(chunk_id)s, %(doc_id)s, %(jurisdiction)s,
+                        %(doc_type)s, %(trust_level)s, %(effective_date)s,
+                        %(source_org)s, %(embedding)s::vector
+                    )
+                    ON CONFLICT (chunk_id) DO UPDATE
+                        SET embedding      = EXCLUDED.embedding,
+                            doc_id         = EXCLUDED.doc_id,
+                            jurisdiction   = EXCLUDED.jurisdiction,
+                            doc_type       = EXCLUDED.doc_type,
+                            trust_level    = EXCLUDED.trust_level,
+                            effective_date = EXCLUDED.effective_date,
+                            source_org     = EXCLUDED.source_org
+                    """,
+                    [
+                        {
+                            "chunk_id": chunk_id,
+                            "doc_id": meta.get("doc_id", ""),
+                            "jurisdiction": meta.get("jurisdiction", ""),
+                            "doc_type": meta.get("doc_type", ""),
+                            "trust_level": meta.get("trust_level", 3),
+                            "effective_date": meta.get("effective_date"),
+                            "source_org": meta.get("source_org"),
+                            # pgvector expects '[f1,f2,...]' string literal
+                            "embedding": "[" + ",".join(str(v) for v in embedding) + "]",
+                        }
+                        for chunk_id, embedding, meta in items
+                    ],
+                    page_size=100,
+                )
+
+    def query(
+        self,
+        embedding: list[float],
+        top_k: int,
+        filters: dict | None = None,
+    ) -> list[tuple[str, float]]:
+        """
+        Retrieve top-k chunk IDs by cosine similarity with optional filters.
+
+        Supported filter keys: jurisdiction, doc_type, doc_id.
+        """
+        clauses = ["1=1"]
+        params: dict = {
+            "embedding": "[" + ",".join(str(v) for v in embedding) + "]",
+            "top_k": top_k,
+        }
+        if filters:
+            if filters.get("jurisdiction"):
+                clauses.append("jurisdiction = %(jurisdiction)s")
+                params["jurisdiction"] = filters["jurisdiction"]
+            if filters.get("doc_type"):
+                clauses.append("doc_type = %(doc_type)s")
+                params["doc_type"] = filters["doc_type"]
+            if filters.get("doc_id"):
+                clauses.append("doc_id = %(doc_id)s")
+                params["doc_id"] = filters["doc_id"]
+            if filters.get("trust_level_max") is not None:
+                clauses.append("trust_level <= %(trust_level_max)s")
+                params["trust_level_max"] = filters["trust_level_max"]
+            if filters.get("effective_date_min") is not None:
+                clauses.append("(effective_date IS NULL OR effective_date >= %(effective_date_min)s)")
+                params["effective_date_min"] = filters["effective_date_min"]
+
+        where = " AND ".join(clauses)
+        sql = f"""
+            SELECT chunk_id,
+                   1 - (embedding <=> %(embedding)s::vector) AS score
+              FROM chunk_vectors
+             WHERE {where}
+             ORDER BY embedding <=> %(embedding)s::vector
+             LIMIT %(top_k)s
+        """
+        with get_connection() as conn:
+            with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+                cur.execute(sql, params)
+                rows = cur.fetchall()
+        return [(str(r["chunk_id"]), float(r["score"])) for r in rows]

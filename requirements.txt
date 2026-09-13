@@ -1,0 +1,24 @@
+fastapi==0.115.0
+uvicorn[standard]==0.30.0
+python-dotenv==1.0.1
+pydantic-settings==2.5.0
+google-genai>=1.0.0
+google-cloud-firestore
+google-cloud-storage
+python-multipart
+pymupdf
+google-cloud-vision
+numpy
+google-cloud-pubsub
+# AlloyDB + pgvector
+google-cloud-alloydb-connector
+pg8000
+asyncpg
+# SQLAlchemy 2.0 async (D4 vector index)
+sqlalchemy[asyncio]
+pgvector
+# HTTP client + HTML parsing for URL ingestion
+httpx
+beautifulsoup4
+lxml
+google-auth
